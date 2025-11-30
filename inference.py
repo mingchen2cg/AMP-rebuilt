@@ -180,7 +180,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AMP 推理脚本")
     parser.add_argument("--mode", type=str, choices=["single", "batch"], default="batch", help="运行模式")
     parser.add_argument("--prompt", type=str, default="Design a short antimicrobial peptide", help="单条推理的提示词")
-    parser.add_argument("--json", type=str, default="/t9k/mnt/amp/prompt/100.json", help="批量推理的JSON路径")
+    parser.add_argument("--json", type=str, default="./data/prompt/100.json", help="批量推理的JSON路径")
     parser.add_argument("--output", type=str, default=None, help="批量结果保存路径 (.fasta)，不填则默认生成")
     parser.add_argument("--k", type=int, default=3, help="每个提示词生成的序列数")
     
