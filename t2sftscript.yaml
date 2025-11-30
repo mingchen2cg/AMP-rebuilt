@@ -30,22 +30,16 @@ spec:
                 - "16"
                 - --learning_rate
                 - "5e-5"
-                # - /t9k/mnt/ts2vec/train.py
-                # - '--config'
-                # - configs/flowmatching/fm_650m_helixscore.yaml
+                - --data_path
+                - "data/Augmentationx10.jsonl"
+                - --weights_path
+                - "weights/Pinal/T2struc-1.2B"
               command:
                 - /t9k/mnt/.conda/envs/amp/bin/python
               workingDir: /t9k/mnt/AMP-rebuilt/
               volumeMounts:
                 - mountPath: /t9k/mnt
                   name: mntdir
-              # env:
-              #   - name: DGLBACKEND
-              #     value: pytorch
-              #   - name: HTTPS_PROXY
-              #     value: 10.233.17.241:3128
-              #   - name: HTTP_PROXY
-              #     value: 10.233.17.241:3128
           volumes:
             - name: mntdir
               persistentVolumeClaim:

@@ -7,17 +7,16 @@ import sys
 import logging
 from datasets import load_dataset
 from transformers import (
-    T5Tokenizer, 
-    AutoModelForSeq2SeqLM, 
     Seq2SeqTrainingArguments, 
     Seq2SeqTrainer, 
     DataCollatorForSeq2Seq
 )
 import transformers
 
-# ================= 固定路径配置 =================
-MODEL_PATH = './weights/ProstT5'
-DATA_FILE = './data/Augmentationx10.jsonl'
+# 导入新的 Loader
+from utils.Prostt5Loader import load_prostt5_model
+
+# 常量定义 (默认值)
 MAX_LENGTH = 64
 
 def get_args():
@@ -27,6 +26,9 @@ def get_args():
     parser.add_argument("--epochs", type=int, default=4, help="Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory")
+    # 添加路径参数
+    parser.add_argument("--model_path", type=str, default='./weights/ProstT5', help="Path to ProstT5 weights")
+    parser.add_argument("--data_path", type=str, default='./data/Augmentationx10.jsonl', help="Path to training data (jsonl)")
     
     return parser.parse_args()
 
@@ -34,43 +36,25 @@ def setup_logging(output_dir):
     """配置日志：同时输出到控制台和文件"""
     log_file_path = os.path.join(output_dir, "training.log")
     
-    # 配置基础 Logger
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         level=logging.INFO,
         handlers=[
-            logging.FileHandler(log_file_path),  # 写入文件
-            logging.StreamHandler(sys.stdout)    # 输出到屏幕
+            logging.FileHandler(log_file_path),
+            logging.StreamHandler(sys.stdout)
         ]
     )
     logger = logging.getLogger(__name__)
     
-    # 让 Transformers 库的日志也输出到这个文件
     transformers.utils.logging.set_verbosity_info()
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
     
-    # 这一步是为了捕获 Transformers 内部的日志到我们的文件
     transformers_logger = transformers.utils.logging.get_logger("transformers")
     transformers_logger.addHandler(logging.FileHandler(log_file_path))
     
     return logger
-
-def load_model_and_tokenizer(model_path, logger):
-    try:
-        logger.info(f"正在加载模型: {model_path} ...")
-        tokenizer = T5Tokenizer.from_pretrained(model_path, do_lower_case=False)
-        
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16 
-        )
-        logger.info("模型加载成功 (BFloat16)。")
-        return model, tokenizer
-    except Exception as e:
-        logger.error(f"加载失败: {e}")
-        return None, None
 
 def preprocess_function(examples, tokenizer):
     inputs = examples["structure"]
@@ -120,16 +104,27 @@ def main():
     logger.info(f"  - Learning Rate: {args.learning_rate}")
     logger.info(f"  - Epochs:        {args.epochs}")
     logger.info(f"  - Output Dir:    {args.output_dir}")
-    logger.info(f"  - Log File:      {os.path.join(args.output_dir, 'training.log')}")
+    logger.info(f"  - Model Path:    {args.model_path}")
+    logger.info(f"  - Data Path:     {args.data_path}")
     logger.info("="*40)
 
-    # 3. 加载模型
-    model, tokenizer = load_model_and_tokenizer(MODEL_PATH, logger)
-    if model is None:
+    # 3. 加载模型 (使用 utils.Prostt5Loader)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"正在使用设备: {device} 加载模型...")
+    
+    # Critical Fix: 显式指定 bfloat16，避免 Loader 自动转为 half (fp16) 导致 NaN
+    model, tokenizer = load_prostt5_model(
+        device, 
+        weights_path=args.model_path, 
+        torch_dtype=torch.bfloat16
+    )
+    
+    if model is None or tokenizer is None:
+        logger.error("模型加载失败，程序退出。")
         return
 
     # 4. 准备数据
-    dataset = load_dataset("json", data_files=DATA_FILE, split="train")
+    dataset = load_dataset("json", data_files=args.data_path, split="train")
     dataset = dataset.train_test_split(test_size=0.1)
     train_dataset = dataset["train"]
     eval_dataset = dataset["test"]
@@ -175,7 +170,6 @@ def main():
         dataloader_num_workers=8,
         dataloader_pin_memory=True,
         
-        # 将 TensorBoard 日志也放在该目录下
         logging_dir=os.path.join(args.output_dir, 'runs'),
         logging_steps=10,
         load_best_model_at_end=True,

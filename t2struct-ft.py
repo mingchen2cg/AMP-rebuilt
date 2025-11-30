@@ -9,13 +9,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.optim import AdamW  # 使用 PyTorch 原生的 AdamW，替代 transformers.AdamW
+from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 from tqdm import tqdm
 from rich.logging import RichHandler
 
 # --- 本地模块 ---
-# 确保你的 utils 目录下有对应的更新后的 loader
 from utils.T2structLoader import load_T2Struc_and_tokenizers
 
 # 全局 logger
@@ -90,15 +89,17 @@ def train(args, run_output_dir):
     logger.info(f"Device: {device}")
     logger.info(f"Output Directory: {run_output_dir}")
     logger.info(f"Weights Path: {args.weights_path}")
+    logger.info(f"Data Path: {args.data_path}")
     logger.info("--------------------------------")
 
     logger.info("Loading model and tokenizers...")
     
-    # 使用更新后的 loader，传入 weights_path
+    # 使用 Loader 加载模型和分词器
     model, text_tokenizer, structure_tokenizer = load_T2Struc_and_tokenizers(
         weights_path=args.weights_path
     )
     
+    # 确保模型在正确的设备上
     model.to(device)
     model.train()
     logger.info("Model loaded successfully.")
@@ -111,7 +112,7 @@ def train(args, run_output_dir):
         shuffle=True, num_workers=4, pin_memory=True
     )
 
-    # 优化器 (使用 torch.optim.AdamW)
+    # 优化器
     optimizer = AdamW(
         model.parameters(), lr=args.learning_rate, betas=(0.9, 0.98), eps=1e-8, weight_decay=0.1
     )
