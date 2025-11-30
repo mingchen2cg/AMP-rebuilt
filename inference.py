@@ -3,6 +3,7 @@ import logging
 import json
 import os
 import argparse
+import gc
 from typing import List, Dict, Any
 
 # 相对引用 utils 包内部的模块
@@ -20,6 +21,9 @@ logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]")
 logger = logging.getLogger("rich")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# === 常量配置 ===
+TRANSLATION_BATCH_SIZE = 32  # 每次翻译送入 GPU 的序列数量，调小可节省显存
+
 def _get_best_3di_candidate(
     prompt_text: str,
     t2struc: torch.nn.Module,
@@ -28,7 +32,6 @@ def _get_best_3di_candidate(
 ) -> str:
     """
     [内部工具函数] 执行一次 T2Struc 推理，并返回概率最高的一条清洗后的 3Di 序列。
-    由于开启了采样 (do_sample=True)，多次调用此函数会返回不同结果。
     """
     if not prompt_text.endswith("."):
         prompt_text += "."
@@ -54,6 +57,7 @@ def _batch_prostt5_translate(
 ) -> List[str]:
     """
     [内部工具函数] 批量将 3Di 序列翻译为 AA 序列。
+    注意：此函数负责单一 batch 的推理，调用方需负责分批传入以防 OOM。
     """
     if not candidates_3di:
         return []
@@ -93,9 +97,7 @@ def generate_single_amp(
     """
     [接口] 单次推理：生成 1 条 AMP 序列。
     """
-    # 1. 获取 1 条最佳结构
     best_3di = _get_best_3di_candidate(prompt_text, t2struc, text_tokenizer, structure_tokenizer)
-    # 2. 翻译为 AA
     results = _batch_prostt5_translate([best_3di], prostt5_model, prostt5_tokenizer)
     return results[0] if results else ""
 
@@ -111,26 +113,45 @@ def generate_k_amps(
 ) -> List[str]:
     """
     [接口] 批量推理：为单个 Prompt 生成 K 条 AMP 序列。
+    包含分批翻译逻辑，防止 OOM。
     """
-    # 1. 循环 K 次获取结构 (利用采样差异性)
+    # 1. 获取结构 (T2Struc 推理通常 batch size 较小或单条进行，这部分主要消耗时间而非瞬间显存)
+    # 如果 k 很大，建议打印进度
     candidates_3di = []
+    
+    # 這裡为了防止中间变量占用过多内存，如果 k 极大，也可以考虑分大块处理
+    # 但 3Di 字符串占用内存很小，主要是翻译时的 Tensor 占用显存
     for _ in range(k):
         best_3di = _get_best_3di_candidate(prompt_text, t2struc, text_tokenizer, structure_tokenizer)
         candidates_3di.append(best_3di)
     
-    # 2. 批量翻译
-    return _batch_prostt5_translate(candidates_3di, prostt5_model, prostt5_tokenizer)
+    # 2. 批量翻译 (分批次送入 GPU)
+    final_sequences = []
+    total_samples = len(candidates_3di)
+    
+    for i in range(0, total_samples, TRANSLATION_BATCH_SIZE):
+        batch_candidates = candidates_3di[i : i + TRANSLATION_BATCH_SIZE]
+        
+        # 执行翻译
+        batch_results = _batch_prostt5_translate(batch_candidates, prostt5_model, prostt5_tokenizer)
+        final_sequences.extend(batch_results)
+        
+        # 清理显存缓存，防止碎片化
+        if i % (TRANSLATION_BATCH_SIZE * 10) == 0:
+            torch.cuda.empty_cache()
+            
+    return final_sequences
 
 
 def run_batch_file_inference(
     t2struc_path: str, 
     prostt5_path: str, 
     json_path: str, 
+    output_fasta_path: str,
     k: int = 1
-) -> Dict[str, Any]:
-    """读取 JSON 文件并进行批量生成"""
+) -> None:
+    """读取 JSON 文件，进行生成，并实时写入文件"""
     
-    # 路径兼容处理：如果传入的是目录，自动补全 pytorch_model.bin
     real_weights_path = t2struc_path
     if os.path.isdir(t2struc_path):
         real_weights_path = os.path.join(t2struc_path, "pytorch_model.bin")
@@ -138,42 +159,65 @@ def run_batch_file_inference(
     logger.info(f"正在加载 T2Struc: {real_weights_path}")
     logger.info(f"正在加载 ProstT5: {prostt5_path}")
 
-    # 加载模型
     try:
         t2struc, txt_tok, struc_tok = load_T2Struc_and_tokenizers("T2struc-1.2B", real_weights_path)
         prostt5_model, prostt5_tok = load_prostt5_model(DEVICE, prostt5_path)
     except Exception as e:
         logger.error(f"模型加载失败: {e}")
-        return {}
+        return
 
-    # 读取数据
     if not os.path.exists(json_path):
         logger.error(f"未找到 JSON 文件: {json_path}")
-        return {}
+        return
         
     with open(json_path, 'r', encoding='utf-8') as f:
         prompts_list = json.load(f).get("prompts", [])
 
-    results_data = {"config": {"k": k}, "results": []}
     logger.info(f"开始处理 {len(prompts_list)} 个 Prompts，每个生成 {k} 条...")
+    logger.info(f"结果将实时写入: {output_fasta_path}")
+    
+    # 确保输出目录存在
+    out_dir = os.path.dirname(output_fasta_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
 
-    for item in prompts_list:
-        p_id = item.get("id")
-        prompt = item.get("prompt")
-        if not prompt: continue
+    # 打开文件准备写入（追加模式或覆盖模式，这里使用覆盖 'w'）
+    # 使用 buffer=1 或者 flush 确保实时写入磁盘
+    with open(output_fasta_path, 'w', encoding='utf-8', buffering=1) as f_out:
+        total_count = 0
         
-        try:
-            sequences = generate_k_amps(prompt, t2struc, txt_tok, struc_tok, prostt5_model, prostt5_tok, k=k)
-            results_data["results"].append({
-                "id": p_id,
-                "prompt": prompt,
-                "generated_sequences": sequences
-            })
-            logger.info(f"ID {p_id} 完成。")
-        except Exception as e:
-            logger.error(f"ID {p_id} 出错: {e}")
+        for item in prompts_list:
+            p_id = item.get("id", "unknown")
+            prompt = item.get("prompt")
+            if not prompt: continue
             
-    return results_data
+            clean_prompt = prompt.replace("\n", " ").replace("\r", "").strip()
+            
+            try:
+                # 获取该 prompt 的 k 条序列
+                # 如果 k 很大（如 5000），generate_k_amps 内部已经做了翻译的 batch 处理
+                sequences = generate_k_amps(prompt, t2struc, txt_tok, struc_tok, prostt5_model, prostt5_tok, k=k)
+                
+                # 立即写入文件
+                for i, seq in enumerate(sequences):
+                    header = f">{p_id}_{i} {clean_prompt}"
+                    f_out.write(f"{header}\n{seq}\n")
+                    total_count += 1
+                
+                # 强制刷新缓冲区并清理显存
+                f_out.flush()
+                os.fsync(f_out.fileno())
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                logger.info(f"ID {p_id} 完成，已写入 {len(sequences)} 条。")
+                
+            except Exception as e:
+                logger.error(f"ID {p_id} 出错: {e}")
+                # 出错时也尝试清理显存以便继续处理下一个
+                torch.cuda.empty_cache()
+
+    logger.info(f"全部完成！共写入 {total_count} 条序列到 {os.path.abspath(output_fasta_path)}")
 
 
 if __name__ == "__main__":
@@ -181,7 +225,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, choices=["single", "batch"], default="batch", help="运行模式")
     parser.add_argument("--prompt", type=str, default="Design a short antimicrobial peptide", help="单条推理的提示词")
     parser.add_argument("--json", type=str, default="./data/prompt/100.json", help="批量推理的JSON路径")
-    parser.add_argument("--output", type=str, default=None, help="批量结果保存路径 (.fasta)，不填则默认生成")
+    parser.add_argument("--output", type=str, default=None, help="批量结果保存路径 (.fasta)")
     parser.add_argument("--k", type=int, default=3, help="每个提示词生成的序列数")
     
     # 默认路径配置
@@ -191,7 +235,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode == "single":
-        # === 单条模式：直接打印 AA 序列 ===
+        # === 单条模式 ===
         real_weights = os.path.join(T2STRUC_DIR, "pytorch_model.bin")
         try:
             t2, tt, st = load_T2Struc_and_tokenizers("T2struc-1.2B", real_weights)
@@ -200,41 +244,17 @@ if __name__ == "__main__":
             logger.info(f"Prompt: {args.prompt}")
             res = generate_single_amp(args.prompt, t2, tt, st, p5, p5t)
             
-            # 直接输出纯净的序列
             print(f"\n[Generated AA Sequence]:\n{res}")
         except Exception as e:
             logger.error(f"推理失败: {e}")
         
     else:
-        # === 批量模式：保存为 FASTA (ID + Prompt) ===
-        output_data = run_batch_file_inference(T2STRUC_DIR, PROSTT5_DIR, args.json, k=args.k)
-        
-        if output_data and output_data.get("results"):
-            # 确定输出文件名
-            if args.output:
-                fasta_path = args.output
-            else:
-                base_name = os.path.basename(args.json).split('.')[0]
-                fasta_path = f"{base_name}_results.fasta"
-
-            logger.info(f"正在写入 FASTA 文件: {fasta_path}")
-            
-            count = 0
-            with open(fasta_path, 'w', encoding='utf-8') as f:
-                for item in output_data["results"]:
-                    p_id = item.get("id", "unknown")
-                    # 获取 Prompt 并移除换行符，防止破坏 FASTA 格式
-                    raw_prompt = item.get("prompt", "")
-                    clean_prompt = raw_prompt.replace("\n", " ").replace("\r", "").strip()
-                    
-                    seqs = item.get("generated_sequences", [])
-                    
-                    for i, seq in enumerate(seqs):
-                        # FASTA Header 格式: >ID_序号 Prompt内容
-                        header = f">{p_id}_{i} {clean_prompt}"
-                        f.write(f"{header}\n{seq}\n")
-                        count += 1
-            
-            logger.info(f"完成！共写入 {count} 条序列到 {os.path.abspath(fasta_path)}")
+        # === 批量模式 ===
+        # 确定输出文件名
+        if args.output:
+            fasta_path = args.output
         else:
-            logger.warning("未生成任何有效结果，文件未保存。")
+            base_name = os.path.basename(args.json).split('.')[0]
+            fasta_path = f"{base_name}_results.fasta"
+            
+        run_batch_file_inference(T2STRUC_DIR, PROSTT5_DIR, args.json, fasta_path, k=args.k)
