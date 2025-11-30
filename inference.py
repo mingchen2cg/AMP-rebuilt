@@ -36,7 +36,7 @@ def _get_best_3di_candidate(
     generation_inputs = T2StrucPrepareGenerationInputs(t2struc, prompt_text, text_tokenizer, structure_tokenizer)
     generation_config = T2StrcuDefaultGenerationConfig()
     
-    # 执行生成 (默认返回 5 条)
+    # 执行生成
     results = T2StrucGeneration(t2struc, generation_inputs, generation_config, structure_tokenizer)
     
     # 排序并取 Top 1
@@ -91,7 +91,7 @@ def generate_single_amp(
     prostt5_tokenizer: Any,
 ) -> str:
     """
-    [保留接口] 单次推理：生成 1 条 AMP 序列。
+    [接口] 单次推理：生成 1 条 AMP 序列。
     """
     # 1. 获取 1 条最佳结构
     best_3di = _get_best_3di_candidate(prompt_text, t2struc, text_tokenizer, structure_tokenizer)
@@ -110,8 +110,7 @@ def generate_k_amps(
     k: int = 1
 ) -> List[str]:
     """
-    批量推理：为单个 Prompt 生成 K 条 AMP 序列。
-    策略：循环 K 次 T2Struc (取Top1)，然后一次性批量运行 ProstT5。
+    [接口] 批量推理：为单个 Prompt 生成 K 条 AMP 序列。
     """
     # 1. 循环 K 次获取结构 (利用采样差异性)
     candidates_3di = []
@@ -149,7 +148,7 @@ def run_batch_file_inference(
 
     # 读取数据
     if not os.path.exists(json_path):
-        logger.error(f"JSON not found: {json_path}")
+        logger.error(f"未找到 JSON 文件: {json_path}")
         return {}
         
     with open(json_path, 'r', encoding='utf-8') as f:
@@ -172,17 +171,17 @@ def run_batch_file_inference(
             })
             logger.info(f"ID {p_id} 完成。")
         except Exception as e:
-            logger.error(f"ID {p_id} Error: {e}")
+            logger.error(f"ID {p_id} 出错: {e}")
             
     return results_data
 
 
 if __name__ == "__main__":
-    # 使用 argparse 以保留灵活性
     parser = argparse.ArgumentParser(description="AMP 推理脚本")
     parser.add_argument("--mode", type=str, choices=["single", "batch"], default="batch", help="运行模式")
     parser.add_argument("--prompt", type=str, default="Design a short antimicrobial peptide", help="单条推理的提示词")
     parser.add_argument("--json", type=str, default="/t9k/mnt/amp/prompt/100.json", help="批量推理的JSON路径")
+    parser.add_argument("--output", type=str, default=None, help="批量结果保存路径 (.fasta)，不填则默认生成")
     parser.add_argument("--k", type=int, default=3, help="每个提示词生成的序列数")
     
     # 默认路径配置
@@ -192,17 +191,50 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode == "single":
-        # 单条测试
-        # 为了演示方便，这里重新加载模型，实际使用建议封装
+        # === 单条模式：直接打印 AA 序列 ===
         real_weights = os.path.join(T2STRUC_DIR, "pytorch_model.bin")
-        t2, tt, st = load_T2Struc_and_tokenizers("T2struc-1.2B", real_weights)
-        p5, p5t = load_prostt5_model(DEVICE, PROSTT5_DIR)
-        
-        res = generate_single_amp(args.prompt, t2, tt, st, p5, p5t)
-        print(f"\nPrompt: {args.prompt}\nResult: {res}")
+        try:
+            t2, tt, st = load_T2Struc_and_tokenizers("T2struc-1.2B", real_weights)
+            p5, p5t = load_prostt5_model(DEVICE, PROSTT5_DIR)
+            
+            logger.info(f"Prompt: {args.prompt}")
+            res = generate_single_amp(args.prompt, t2, tt, st, p5, p5t)
+            
+            # 直接输出纯净的序列
+            print(f"\n[Generated AA Sequence]:\n{res}")
+        except Exception as e:
+            logger.error(f"推理失败: {e}")
         
     else:
-        # 批量测试
-        output = run_batch_file_inference(T2STRUC_DIR, PROSTT5_DIR, args.json, k=args.k)
-        # 简单打印结果摘要
-        print(f"完成。共生成 {len(output['results'])} 组结果。")
+        # === 批量模式：保存为 FASTA (ID + Prompt) ===
+        output_data = run_batch_file_inference(T2STRUC_DIR, PROSTT5_DIR, args.json, k=args.k)
+        
+        if output_data and output_data.get("results"):
+            # 确定输出文件名
+            if args.output:
+                fasta_path = args.output
+            else:
+                base_name = os.path.basename(args.json).split('.')[0]
+                fasta_path = f"{base_name}_results.fasta"
+
+            logger.info(f"正在写入 FASTA 文件: {fasta_path}")
+            
+            count = 0
+            with open(fasta_path, 'w', encoding='utf-8') as f:
+                for item in output_data["results"]:
+                    p_id = item.get("id", "unknown")
+                    # 获取 Prompt 并移除换行符，防止破坏 FASTA 格式
+                    raw_prompt = item.get("prompt", "")
+                    clean_prompt = raw_prompt.replace("\n", " ").replace("\r", "").strip()
+                    
+                    seqs = item.get("generated_sequences", [])
+                    
+                    for i, seq in enumerate(seqs):
+                        # FASTA Header 格式: >ID_序号 Prompt内容
+                        header = f">{p_id}_{i} {clean_prompt}"
+                        f.write(f"{header}\n{seq}\n")
+                        count += 1
+            
+            logger.info(f"完成！共写入 {count} 条序列到 {os.path.abspath(fasta_path)}")
+        else:
+            logger.warning("未生成任何有效结果，文件未保存。")
