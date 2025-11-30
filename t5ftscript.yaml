@@ -1,0 +1,60 @@
+apiVersion: batch.tensorstack.dev/v1beta1
+kind: PyTorchTrainingJob
+metadata:
+  name: ptostt5-ft-epo2lr5e5bs16
+spec:
+  replicaSpecs:
+    - type: worker
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+            - image: >-
+                registry.ibmc.t9kcloud.cn/t9kpublic/jupyterlab-miniconda-24.7.1:20241031-sudo
+              name: pytorch
+              resources:
+                requests:
+                  cpu: '1'
+                  memory: 4Gi
+                  nvidia.com/gpu: '1'
+                limits:
+                  cpu: '4'
+                  memory: 32Gi
+                  nvidia.com/gpu: '1'
+              args:
+                - t5ft.py
+                - --batch_size
+                - "16"
+                - --epochs
+                - "2"
+                - --learning_rate
+                - "5e-5"
+                # - /t9k/mnt/ts2vec/train.py
+                # - '--config'
+                # - configs/flowmatching/fm_650m_helixscore.yaml
+              command:
+                - /t9k/mnt/.conda/envs/amp/bin/python
+              workingDir: /t9k/mnt/AMP-rebuilt/
+              volumeMounts:
+                - mountPath: /t9k/mnt
+                  name: mntdir
+              # env:
+              #   - name: DGLBACKEND
+              #     value: pytorch
+              #   - name: HTTPS_PROXY
+              #     value: 10.233.17.241:3128
+              #   - name: HTTP_PROXY
+              #     value: 10.233.17.241:3128
+          volumes:
+            - name: mntdir
+              persistentVolumeClaim:
+                claimName: work
+  # runMode:
+  #   debug:
+  #     enabled: false
+  #     replicaSpecs: []
+  # scheduler:
+  #   t9kScheduler:
+  #     priority: 0
+  #     queue: a100
