@@ -10,75 +10,55 @@ from transformers import (
     Seq2SeqTrainingArguments,
     Seq2SeqTrainer,
     DataCollatorForSeq2Seq,
-    TrainerCallback  # 引入 Callback
+    TrainerCallback
 )
-# 引入 transformers 的日志工具以便接管
 import transformers.utils.logging as hf_logging 
 from rich.logging import RichHandler
 
-# 引入本地模块 (确保 utils 和 models 文件夹在当前目录下)
+# 引入本地模块
 from utils.T2structLoader import load_T2Struc_and_tokenizers
 from utils.Prostt5Loader import load_prostt5_model
 from models.FusionModel import ProstT5WithGatedFusion
 
 # =================================================================
-# 0. 日志与输出重定向工具 (新增)
+# 0. 日志与输出重定向工具
 # =================================================================
 class StreamToLogger(object):
-    """
-    将 sys.stdout 和 sys.stderr 重定向到 logger，
-    同时保留在控制台的输出。
-    """
     def __init__(self, logger, log_level=logging.INFO):
         self.logger = logger
         self.log_level = log_level
-        self.linebuf = ''
 
     def write(self, buf):
         for line in buf.rstrip().splitlines():
-            # 记录到日志文件
             self.logger.log(self.log_level, line.rstrip())
-        # 同时输出到原来的控制台 (RichHandler 会处理 formatting，这里直接 print 可能会乱，
-        # 但为了保留原始流行为，通常交给 handler 处理。
-        # 由于我们用了 RichHandler 作为 root handler，这里不需要再次 print 到 stdout，
-        # 否则会出现双重打印。但为了兼容进度条，通常不做完全拦截，
-        # 简单方案是只依赖 Logging 的 FileHandler)
-        pass 
 
     def flush(self):
         pass
 
 def setup_logging(output_dir):
-    # 1. 创建 Logger
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     
-    # 2. 格式设置
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     
-    # 3. File Handler (写入文件)
     log_file = os.path.join(output_dir, "train.log")
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.INFO)
     logger.addHandler(file_handler)
     
-    # 4. Rich Handler (控制台输出)
     rich_handler = RichHandler(rich_tracebacks=True)
     rich_handler.setLevel(logging.INFO)
     logger.addHandler(rich_handler)
     
-    # 5. 设置 Transformers 的日志
     hf_logging.set_verbosity_info()
     hf_logging.enable_default_handler()
     hf_logging.enable_explicit_format()
-    # 将 transformers 的日志也导向我们的 file handler
     hf_logger = hf_logging.get_logger("transformers")
     hf_logger.addHandler(file_handler)
 
     return logger
 
-# 全局 logger 占位，稍后在 main 中初始化
 logger = logging.getLogger("root")
 
 # =================================================================
@@ -122,19 +102,15 @@ class FusionDataCollator:
         }
 
 # =================================================================
-# 2. 自定义 Callback (新增：每个 Epoch 保存)
+# 2. 自定义 Callback (每个 Epoch 保存)
 # =================================================================
 class SaveModelAtEpochEndCallback(TrainerCallback):
-    """
-    在每个 Epoch 结束时，强制保存模型权重和 Tokenizer 到指定目录
-    """
     def __init__(self, output_dir, text_tokenizer, prost_tokenizer):
         self.output_dir = output_dir
         self.text_tokenizer = text_tokenizer
         self.prost_tokenizer = prost_tokenizer
 
     def on_epoch_end(self, args, state, control, **kwargs):
-        # 当前 Epoch 数 (state.epoch 是 float，转为 int)
         current_epoch = int(state.epoch)
         save_path = os.path.join(self.output_dir, f"epoch_{current_epoch}_model")
         
@@ -142,15 +118,11 @@ class SaveModelAtEpochEndCallback(TrainerCallback):
         
         logger.info(f"=== Epoch {current_epoch} 结束，正在保存模型至 {save_path} ===")
         
-        # 获取模型对象 (处理可能的 DataParallel 包装)
         model = kwargs['model']
         if hasattr(model, 'module'):
             model = model.module
             
-        # 1. 保存模型权重 (bin 格式)
         torch.save(model.state_dict(), os.path.join(save_path, "pytorch_model.bin"))
-        
-        # 2. 保存 Tokenizers
         self.text_tokenizer.save_pretrained(os.path.join(save_path, "text_tokenizer"))
         self.prost_tokenizer.save_pretrained(os.path.join(save_path, "prostt5_tokenizer"))
         
@@ -199,8 +171,12 @@ def main():
     parser.add_argument("--prostt5_path", type=str, default='./weights/ProstT5', help="ProstT5 权重路径")
     parser.add_argument("--output_dir", type=str, default=None, help="输出目录")
     
-    # 训练超参
-    parser.add_argument("--batch_size", type=int, default=16)
+    # --- 性能相关参数 (已修改) ---
+    # 默认值改为 24 以兼容 A40；H20 可通过命令行指定 96
+    parser.add_argument("--batch_size", type=int, default=24, help="批量大小 (默认24兼容A40，H20建议96)")
+    # 默认使用 4 个 CPU 核心加载数据
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数 (建议设为 CPU 核心数的一半)")
+    
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
@@ -213,12 +189,13 @@ def main():
         args.output_dir = f"./finetuned_fusion/{timestamp}"
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # --- 启动日志系统 (核心修改) ---
+    # --- 启动日志系统 ---
     global logger
     logger = setup_logging(args.output_dir)
     
     logger.info("=== 启动训练任务 ===")
     logger.info(f"输出目录: {args.output_dir}")
+    logger.info(f"Batch Size: {args.batch_size}, Num Workers: {args.num_workers}")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -254,19 +231,21 @@ def main():
         warmup_ratio=args.warmup_ratio,
         logging_steps=50,
         
-        # 这里的 save_strategy 设为 epoch，Trainer 会自动保存 checkpoint-xxx
-        # 但我们主要依赖自定义 Callback 来保存干净的权重
         save_strategy="epoch", 
         evaluation_strategy="epoch",
         
         bf16=True, 
-        dataloader_num_workers=4,
+        
+        # --- 性能优化配置 ---
+        dataloader_num_workers=args.num_workers, # 默认为 4
+        tf32=True,                               # 开启 TF32 (A40 和 H20 都支持且推荐)
+        dataloader_pin_memory=True,              # 加速传输
+        group_by_length=True,                    # 减少 Padding
+        # -------------------
+
         remove_unused_columns=False, 
         label_names=["labels"],
         save_safetensors=False,
-        
-        # 禁用 Trainer 自带的进度条控制台输出，
-        # 因为我们想把所有东西都重定向到 log (可选，若不需要可注释掉)
         disable_tqdm=False 
     )
     
@@ -278,7 +257,6 @@ def main():
         eval_dataset=dataset["test"],
         data_collator=collator,
         tokenizer=prost_tok,
-        # 添加自定义 Callback
         callbacks=[SaveModelAtEpochEndCallback(args.output_dir, text_tok, prost_tok)]
     )
     
@@ -286,7 +264,7 @@ def main():
     logger.info("开始训练...")
     trainer.train()
     
-    # 6. 保存最终模型 (作为一个 fallback)
+    # 6. 保存最终模型
     logger.info("正在保存最终模型 (Final)...")
     final_path = os.path.join(args.output_dir, "final_model")
     os.makedirs(final_path, exist_ok=True) 
